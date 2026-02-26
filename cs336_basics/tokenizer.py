@@ -1,229 +1,280 @@
-from collections import Counter
-import re
+import functools
 import pickle
-from functools import lru_cache
-from typing import Dict, List, Tuple, Optional, Type
+from collections import Counter
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Type
 
-# 改用增强版正则库（兼容Unicode，和专业版对齐），若没有可替换为标准re（需注意\p{L}等语法仅regex支持）
-try:
-    import regex as re
-except ImportError:
-    import re
-    print("提示：未安装regex库，部分Unicode分段功能可能受限，请执行 pip install regex")
+import regex as re  # 增强版正则库，支持Unicode字符匹配（如\p{L}匹配所有语言的字母）
 
 
-class BPETokenizer:
+# ===================== 核心类：BPE分词器 =====================
+class Tokenizer:
     """
-    融合版BPE分词器：保留核心BPE逻辑，整合实用功能点
-    核心功能：
-    - 基础编码/解码（极简版核心逻辑）
-    - 特殊标记处理（如<|endoftext|>）
-    - 优化的文本分段正则（更合理的单词/数字/标点拆分）
-    - 编码缓存（提升重复token编码速度）
-    - 从pickle文件加载词表/合并规则
+    轻量级BPE（字节对编码）分词器，支持：
+    - 文本→token ID编码 / token ID→文解码
+    - 特殊标记（如<|endoftext|>）处理
+    - 大文本的内存高效迭代编码
     """
 
     def __init__(
         self,
-        vocab: Dict[int, bytes],          # 词表：{token ID: 字节序列}
-        merges: List[Tuple[bytes, bytes]],# 合并规则：[(左字节, 右字节), ...]
-        special_tokens: Optional[List[str]] = None,  # 特殊标记（如["<|endoftext|>"]）
+        vocab: Dict[int, bytes],          # 词表：{token ID: 字节序列}（如{123: b'hello'}）
+        merges: List[Tuple[bytes, bytes]],# BPE合并规则：按合并顺序存储的字节对列表（如[(b'h', b'e'), (b'he', b'l')]）
+        special_tokens: Optional[List[str]] = None,  # 特殊标记列表（如["<|endoftext|>"]）
     ) -> None:
-        # 基础配置（继承极简版）
-        self.vocab = vocab
-        self.merges = merges
-        self.special_tokens = special_tokens or []
+        """
+        初始化分词器：构建反向映射、合并规则索引、正则表达式（用于文本分段）
+        """
+        # 保存基础配置
+        self.vocab: Dict[int, bytes] = vocab
+        self.merges: List[Tuple[bytes, bytes]] = merges
+        self.special_tokens: List[str] = special_tokens or []
 
-        # 反向映射（编码用）+ 合并规则优先级（继承极简版）
+        # 构建反向映射：字节序列→token ID（编码时用）
         self.token2id: Dict[bytes, int] = {v: k for k, v in vocab.items()}
+        # 构建合并规则索引：字节对→合并顺序（rank越小，合并优先级越高）
         self.merge2rank: Dict[Tuple[bytes, bytes], int] = {
             merge: i for i, merge in enumerate(merges)
         }
 
-        # ========== 整合专业版的实用功能：优化的正则分段 ==========
-        # 核心正则：更合理的文本分段（支持缩写、多语言字母、数字、标点）
+        # ===================== 正则表达式：文本分段规则 =====================
+        # 核心正则：匹配文本中的「单词/数字/标点/空格」，保证分段合理性
+        # 拆解：
+        # - '(?:[sdmt]|ll|ve|re)'：匹配缩写（如it's、you'll、I've）
+        # - ?\p{L}+：匹配任意语言的字母（带可选前导空格）
+        # - ?\p{N}+：匹配数字（带可选前导空格）
+        # - ?[^\s\p{L}\p{N}]+：匹配标点/符号（带可选前导空格）
+        # - \s+(?!\S)：匹配末尾空格
+        # - \s+：匹配其他空格
         self.token_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         self.compiled_token_pattern = re.compile(self.token_pattern)
 
-        # 特殊标记正则：按长度降序匹配（避免短标记覆盖长标记）
+        # 特殊标记正则：匹配所有特殊token（按长度降序，避免短token匹配覆盖长token）
         if self.special_tokens:
+            # 转义特殊字符（如|、<、>），用|拼接，包裹捕获组（split后保留特殊token）
             self.special_tokens_pattern = (
-                "(" + "|".join([re.escape(t) for t in sorted(self.special_tokens, key=len, reverse=True)]) + ")"
+                "("
+                + "|".join(
+                    [
+                        re.escape(f"{token}")
+                        for token in sorted(self.special_tokens, key=len, reverse=True)
+                    ]
+                )
+                + ")"
             )
-            self.compiled_special_tokens_pattern = re.compile(self.special_tokens_pattern)
+        else:
+            self.special_tokens_pattern = "(?!)"  # 匹配空的正则（无特殊token时）
+        self.compiled_special_tokens_pattern = re.compile(self.special_tokens_pattern)
 
     @classmethod
     def from_files(
-        cls: Type["BPETokenizer"],
-        vocab_filepath: str,
-        merges_filepath: str,
-        special_tokens: Optional[List[str]] = None,
-    ) -> "BPETokenizer":
+        cls: Type["Tokenizer"],
+        vocab_filepath: str,             # 词表文件路径（pickle序列化的Dict[int, bytes]）
+        merges_filepath: str,            # 合并规则文件路径（pickle序列化的List[Tuple[bytes, bytes]]）
+        special_tokens: Optional[List[str]] = None,  # 特殊标记列表
+    ) -> "Tokenizer":
         """
-        整合专业版功能：从pickle文件加载词表和合并规则（实用的文件加载能力）
+        类方法：从文件加载预训练的词表和合并规则，初始化分词器
         """
+        # 加载词表（二进制读取，因为vocab值是bytes）
         with open(vocab_filepath, "rb") as f:
             vocab = pickle.load(f)
+        # 加载合并规则
         with open(merges_filepath, "rb") as f:
             merges = pickle.load(f)
+        # 实例化分词器
         return cls(vocab, merges, special_tokens)
 
-    # ========== 整合专业版功能：编码缓存（提升重复token编码速度） ==========
-    @lru_cache(maxsize=16 * 1024)  # 缓存前16384个token的编码结果
+    @functools.lru_cache(maxsize=16 * 1024)  # 缓存前16384个token的编码结果，提升重复token编码速度
     def encode_token(self, word: str) -> List[int]:
         """
-        核心BPE编码逻辑（继承极简版，保持逻辑不变）
-        对单个文本片段执行BPE合并，返回token ID列表
+        核心方法：对单个文本片段（如"hello"）执行BPE编码，返回token ID列表
+        步骤：1. 文本→字节序列 2. 迭代合并最高优先级的字节对 3. 映射为token ID
         """
-        # 文本→单个字节列表（初始状态）
+        # 步骤1：将文本转换为UTF-8字节序列，拆分为单个字节的列表（BPE的初始状态）
+        # 例如："hello" → b'hello' → [b'h', b'e', b'l', b'l', b'o']
         tokens = [bytes([i]) for i in word.encode("utf-8")]
 
-        # 内部函数：找到优先级最高的可合并字节对
-        def get_best_merge(tokens: List[bytes]) -> Optional[Tuple[bytes, bytes]]:
-            min_rank = float("inf")
-            best_pair = None
+        # 内部函数：找到当前token列表中「优先级最高」的可合并字节对
+        def get_merge(tokens: List[bytes]) -> Optional[Tuple[bytes, bytes]]:
+            min_rank = float("inf")  # 最小rank=最高优先级（rank越小，合并越早）
+            candidate: Optional[Tuple[bytes, bytes]] = None  # 待返回的最优合并对
+            # 遍历所有相邻字节对
             for i in range(len(tokens) - 1):
                 pair = (tokens[i], tokens[i + 1])
+                # 若该字节对在合并规则中，且rank更小（优先级更高）
                 if pair in self.merge2rank and self.merge2rank[pair] < min_rank:
                     min_rank = self.merge2rank[pair]
-                    best_pair = pair
-            return best_pair
+                    candidate = pair
+            return candidate  # 返回最优合并对（无则返回None）
 
-        # 迭代合并（核心逻辑无改动）
+        # 步骤2：迭代执行BPE合并，直到无可用合并对
         while True:
-            merge_pair = get_best_merge(tokens)
-            if merge_pair is None:
+            merge = get_merge(tokens)  # 获取当前最优合并对
+            if merge is None:  # 无合并对，终止循环
                 break
-            left, right = merge_pair
-            new_tokens = []
+            # 执行合并：遍历token列表，替换合并对为新token
+            new_tokens: List[bytes] = []
             i = 0
             while i < len(tokens):
-                if i < len(tokens) - 1 and tokens[i] == left and tokens[i + 1] == right:
-                    new_tokens.append(left + right)
+                # 匹配到合并对：替换为合并后的新token，i+2跳过下一个token
+                if (
+                    i < len(tokens) - 1
+                    and tokens[i] == merge[0]
+                    and tokens[i + 1] == merge[1]
+                ):
+                    new_tokens.append(merge[0] + merge[1])  # 合并字节对
                     i += 2
                 else:
+                    # 未匹配：保留原token，i+1
                     new_tokens.append(tokens[i])
                     i += 1
-            tokens = new_tokens
+            tokens = new_tokens  # 更新token列表，进入下一轮合并
 
-        # 字节序列→token ID
+        # 步骤3：将合并后的字节序列映射为token ID（查token2id）
         return [self.token2id[token] for token in tokens]
 
     def encode(self, text: str) -> List[int]:
         """
-        完整编码逻辑（整合专业版：特殊标记处理 + 优化分段）
+        完整文本编码：处理特殊标记 + 正则分段 + 逐段BPE编码
         """
-        token_ids = []
+        token_ids = []  # 存储最终的token ID序列
 
-        # 步骤1：处理特殊标记（拆分并保留特殊token）
-        if self.special_tokens:
-            for segment in self.compiled_special_tokens_pattern.split(text):
-                # 特殊标记直接编码，不参与BPE合并
-                if segment in self.special_tokens:
-                    token_ids.append(self.token2id[segment.encode("utf-8")])
-                    continue
-                # 非特殊标记按正则分段后编码
-                for match in self.compiled_token_pattern.finditer(segment):
-                    word = match.group(0)
-                    token_ids += self.encode_token(word)
-        else:
-            # 无特殊标记时，直接按正则分段编码
-            for match in self.compiled_token_pattern.finditer(text):
-                word = match.group(0)
+        # 步骤1：按特殊标记拆分文本（保留特殊token在拆分结果中）
+        # 例如："hello<|endoftext|>world" → ["hello", "<|endoftext|>", "world"]
+        for segment in self.compiled_special_tokens_pattern.split(text):
+            # 若分段是特殊token：直接编码（不执行BPE）
+            if segment in self.special_tokens:
+                # 特殊token→字节→token ID
+                token_ids.append(self.token2id[segment.encode("utf-8")])
+                continue
+            # 步骤2：对非特殊token的分段，按token_pattern拆分（单词/数字/标点等）
+            for match in self.compiled_token_pattern.finditer(segment):
+                word = match.group(0)  # 提取单个文本片段（如"hello"、","、"123"）
+                # 对该片段执行BPE编码，结果追加到token_ids
                 token_ids += self.encode_token(word)
-
         return token_ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        内存高效的迭代式编码：对可迭代文本（如文件句柄）逐行编码，返回token ID生成器
+        适配：无法一次性加载到内存的大文本文件（如GB级数据集）
+        """
+        for text in iterable:
+            # 对每行文本编码，逐个yield token ID（避免一次性存储所有ID）
+            for token_id in self.encode(text):
+                yield token_id
 
     def decode(self, ids: List[int]) -> str:
         """
-        解码逻辑（继承极简版，保持不变）
+        解码：将token ID序列转换回Unicode文本
         """
-        bytes_list = [self.vocab[tid] for tid in ids]
+        # 步骤1：token ID→字节序列列表
+        bytes_list = [self.vocab[token_id] for token_id in ids]
+        # 步骤2：拼接字节序列→解码为文本（errors="replace"：替换无效字节，避免解码失败）
         return b"".join(bytes_list).decode("utf-8", errors="replace")
 
 
-# ===================== 训练+测试代码（适配融合版分词器） =====================
+# ===================== 辅助函数：多进程编码相关 =====================
+def _encode_with_text(t: str):
+    """
+    多进程编码的单任务函数：输入文本，返回（文本, token ID列表）
+    用于进程池映射，方便更新进度条（通过文本长度计算处理进度）#todo 进程池映射？
+    """
+    return (t, tokenizer.encode(t))
+
+
+def _accumulate_iter(iterable: Iterable[str], min_size: int) -> Iterator[str]:
+    """
+    文本累积函数：将可迭代文本（如逐行读取的文件）累积到至少min_size字符后返回
+    作用：减少多进程通信次数（频繁传递小文本会降低效率）
+    """
+    batch = ""  # 累积的文本批次
+    for text in iterable:
+        batch += text
+        # 累积到最小尺寸，返回批次并清空
+        if len(batch) >= min_size:
+            yield batch
+            batch = ""
+    # 处理最后一批（不足min_size的剩余文本）
+    if batch:
+        yield batch
+
+
+def _init_worker(tok: Tokenizer):
+    """
+    进程池初始化函数：为每个子进程设置全局tokenizer
+    原因：multiprocessing的进程间无法直接共享复杂对象，需单独初始化
+    """
+    global tokenizer
+    tokenizer = tok
+
+
+# ===================== 主函数：批量编码大文本文件 =====================
 if __name__ == "__main__":
-    # 1. 简化版BPE训练函数（继承极简版，用于生成测试用的vocab/merges）
-    def simple_pre_tokenize(text: str) -> Counter[str]:
-        """预分词：和分词器的正则分段逻辑对齐"""
-        pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        tokens = re.findall(pattern, text)
-        return Counter(tokens)
+    import array
+    import multiprocessing
+    import os
 
-    def simple_train_bpe(text: str, vocab_size: int) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
-        word_counts = simple_pre_tokenize(text)
-        # 初始化256个基础字节
-        vocab: List[bytes] = [bytes([i]) for i in range(256)]
-        merges: List[Tuple[bytes, bytes]] = []
-        # 初始化单词字典
-        words = {}
-        for word_str, count in word_counts.items():
-            tokens = [bytes([i]) for i in word_str.encode("utf-8")]
-            words[word_str] = {"tokens": tokens, "count": count}
-        # BPE合并循环
-        while len(vocab) < vocab_size:
-            # 统计字节对频率
-            pair_counts = Counter[Tuple[bytes, bytes]]()
-            for word in words.values():
-                tokens = word["tokens"]
-                count = word["count"]
-                for i in range(len(tokens) - 1):
-                    pair = (tokens[i], tokens[i + 1])
-                    pair_counts[pair] += count
-            if not pair_counts:
-                break
-            # 合并最频繁的字节对
-            most_common_pair = pair_counts.most_common(1)[0][0]
-            new_token = most_common_pair[0] + most_common_pair[1]
-            vocab.append(new_token)
-            merges.append(most_common_pair)
-            # 更新单词的token列表
-            for word in words.values():
-                tokens = word["tokens"]
-                new_tokens = []
-                i = 0
-                while i < len(tokens):
-                    if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == most_common_pair:
-                        new_tokens.append(new_token)
-                        i += 2
-                    else:
-                        new_tokens.append(tokens[i])
-                        i += 1
-                word["tokens"] = new_tokens
-        # 转换为字典
-        vocab_dict = {i: tok for i, tok in enumerate(vocab)}
-        return vocab_dict, merges
+    import numpy as np
+    import tqdm  # 进度条库
 
-    # 2. 测试流程
-    test_text = "hello hello world！世界123<|endoftext|>hello you'll"
-    # 训练BPE（词表大小=256+5，合并5次）
-    vocab, merges = simple_train_bpe(test_text, vocab_size=261)
-    # 初始化融合版分词器（加入特殊标记）
-    tokenizer = BPETokenizer(vocab, merges, special_tokens=["<|endoftext|>"])
-
-    # 3. 测试编码/解码
-    encode_ids = tokenizer.encode(test_text)
-    print("===== 编码结果 =====")
-    print(f"原始文本：{test_text}")
-    print(f"Token IDs：{encode_ids}")
-
-    decode_text = tokenizer.decode(encode_ids)
-    print("\n===== 解码结果 =====")
-    print(f"解码文本：{decode_text}")
-    print(f"核心内容是否一致：{test_text.replace(' ', '') == decode_text.replace(' ', '')}")
-
-    # 4. 测试文件保存/加载（整合专业版的from_files功能）
-    # 保存vocab和merges到pickle文件
-    with open("test_vocab.pkl", "wb") as f:
-        pickle.dump(vocab, f)
-    with open("test_merges.pkl", "wb") as f:
-        pickle.dump(merges, f)
-    # 从文件加载分词器
-    tokenizer_from_file = BPETokenizer.from_files(
-        "test_vocab.pkl", "test_merges.pkl", special_tokens=["<|endoftext|>"]
+    # 步骤1：初始化分词器（加载预训练的词表和合并规则）
+    tokenizer = Tokenizer.from_files(
+        "../data/owt_train/bpe_vocab.pkl",          # OpenWebText训练集的BPE词表
+        "../data/owt_train/bpe_merges.pkl",         # OpenWebText训练集的BPE合并规则
+        special_tokens=["<|endoftext|>"],           # 特殊标记：文本结束符
     )
-    # 验证加载后的编码结果一致
-    encode_ids_from_file = tokenizer_from_file.encode(test_text)
-    print("\n===== 文件加载验证 =====")
-    print(f"加载后编码结果是否一致：{encode_ids == encode_ids_from_file}")
+
+    # 步骤2：初始化token ID缓冲区（array.array比list更节省内存，"H"=uint16，适配token ID范围）
+    token_ids_buf = array.array("H")
+
+    # 步骤3：处理大文本文件（OpenWebText训练集）
+    file_path = "../data/owt_train.txt"
+    with open(file_path, "r") as f:
+        # 获取文件总字符数（用于进度条）
+        f.seek(0, os.SEEK_END)
+        bytes_len = f.tell()
+        f.seek(0)  # 重置文件指针到开头
+
+        # 初始化进度条（显示编码进度）
+        with tqdm.tqdm(
+            total=bytes_len,
+            unit="char",
+            desc="Encoding",
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n:,}/{total:,} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+        ) as pbar:
+            # 步骤4：启动多进程池（8进程），初始化每个进程的tokenizer
+            with multiprocessing.Pool(
+                processes=8, initializer=_init_worker, initargs=(tokenizer,)
+            ) as pool:
+                # 步骤5：批量编码
+                # 1. _accumulate_iter：将文本累积为128KB批次（减少进程通信）
+                # 2. pool.imap：并行执行_encode_with_text，返回（文本, token ID）
+                batch_ids = pool.imap(
+                    _encode_with_text, _accumulate_iter(f, 128 * 1024)
+                )
+                # 遍历编码结果，更新缓冲区和进度条
+                for text, ids in batch_ids:
+                    token_ids_buf.extend(ids)  # 将token ID追加到缓冲区
+                    # 更新进度条：按文本的UTF-8字节数（而非字符数）统计
+                    pbar.update(len(text.encode("utf-8")))
+
+    # 步骤6：将缓冲区转换为numpy数组（uint16，节省内存），保存为npy文件
+    token_ids = np.frombuffer(token_ids_buf, dtype=np.uint16)
+    np.save("token_ids.npy", token_ids)
+
+    # 步骤7：计算压缩比（原始文本字节数 / token总数 → 每个token平均编码的字节数）
+    print(f"Compression ratio: {bytes_len/(token_ids.size):.2f}")
+    exit()
+
+    # ===================== 测试代码（注释掉，用于验证编码/解码功能） =====================
+    token_ids = tokenizer.encode("Hello, 世界！<|endoftext|>")
+    print("Token IDs:")
+    print(token_ids)
+    print("Tokens:")
+    print([tokenizer.vocab[token_id] for token_id in token_ids])
+    text = tokenizer.decode(token_ids)
+    print("Decoded text:")
+    print(text)
+    print("Decoded text:")
+    print(text)
