@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import time
@@ -20,11 +21,11 @@ except Exception:
 try:
     from .module import TransformerLM
     from .moe import MoETransformerLM
-    from .optimizer import AdamW, get_lr_cosine_schedule, gradient_clipping
+    from .optimizer import AdamW, Muon, get_lr_cosine_schedule, gradient_clipping
 except ImportError:
     from module import TransformerLM
     from moe import MoETransformerLM
-    from optimizer import AdamW, get_lr_cosine_schedule, gradient_clipping
+    from optimizer import AdamW, Muon, get_lr_cosine_schedule, gradient_clipping
 
 
 def get_batch(
@@ -52,6 +53,7 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     iteration: int,
+    scaler: torch.cuda.amp.GradScaler | None,
     out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
 ) -> None:
     checkpoint = {
@@ -59,6 +61,8 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "iteration": iteration,
     }
+    if scaler is not None and scaler.is_enabled():
+        checkpoint["scaler"] = scaler.state_dict()
     torch.save(checkpoint, out)
 
 
@@ -66,12 +70,53 @@ def load_checkpoint(
     src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> int:
     device = next(model.parameters()).device
     checkpoint = torch.load(src, map_location=device)
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
+    if scaler is not None and scaler.is_enabled() and "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
     return checkpoint["iteration"]
+
+
+def _device_type(device: str | torch.device) -> str:
+    if isinstance(device, torch.device):
+        return device.type
+    return torch.device(device).type
+
+
+def _resolve_amp_dtype(value: str) -> torch.dtype:
+    normalized = value.strip().lower()
+    if normalized in {"fp16", "float16", "half"}:
+        return torch.float16
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(f"Unsupported amp_dtype: {value}")
+
+
+def _split_muon_parameter_groups(
+    model: torch.nn.Module,
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    """
+    Muon通常只用于Transformer内部矩阵；embedding / lm_head / norm / bias回退到AdamW。
+    """
+    muon_params: list[torch.nn.Parameter] = []
+    fallback_params: list[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (
+            param.ndim >= 2
+            and "token_embedding" not in name
+            and "output_embedding" not in name
+            and "router" not in name
+        ):
+            muon_params.append(param)
+        else:
+            fallback_params.append(param)
+    return muon_params, fallback_params
 
 
 class TrainConfig(typing.TypedDict):
@@ -110,6 +155,14 @@ class TrainConfig(typing.TypedDict):
     wandb_name: str
 
     model_type: typing.NotRequired[str]
+    optimizer_type: typing.NotRequired[str]
+    use_amp: typing.NotRequired[bool]
+    amp_dtype: typing.NotRequired[str]
+    label_smoothing: typing.NotRequired[float]
+    activation_checkpointing: typing.NotRequired[bool]
+    muon_ns_steps: typing.NotRequired[int]
+    muon_ns_eps: typing.NotRequired[float]
+    muon_nesterov: typing.NotRequired[bool]
     num_experts: typing.NotRequired[int]
     moe_top_k: typing.NotRequired[int]
     moe_fixed_expert_idx: typing.NotRequired[int]
@@ -148,6 +201,12 @@ TinyStoriesConfig = TrainConfig(
     use_wandb=False,
     wandb_project="cs336",
     wandb_name="tiny_stories_dense_baseline",
+    model_type="dense",
+    optimizer_type="adamw",
+    use_amp=False,
+    amp_dtype="float16",
+    label_smoothing=0.0,
+    activation_checkpointing=False,
 )
 
 
@@ -181,6 +240,11 @@ OpenWebTextBaselineConfig = TrainConfig(
     wandb_project="cs336-baseline",
     wandb_name="openwebtext_dense_baseline",
     model_type="dense",
+    optimizer_type="adamw",
+    use_amp=False,
+    amp_dtype="float16",
+    label_smoothing=0.0,
+    activation_checkpointing=False,
 )
 
 
@@ -214,12 +278,58 @@ OpenWebTextMoEConfig = TrainConfig(
     wandb_project="cs336-moe",
     wandb_name="openwebtext_moe_baseline",
     model_type="moe",
+    optimizer_type="adamw",
+    use_amp=False,
+    amp_dtype="float16",
+    label_smoothing=0.0,
+    activation_checkpointing=False,
     num_experts=5,
     moe_top_k=2,
     moe_fixed_expert_idx=0,
     moe_expert_d_ffs=[2048, 1024, 1024, 1024, 1024],
     moe_aux_loss_coef=1e-2,
     moe_z_loss_coef=1e-4,
+)
+
+
+OpenWebTextMuonConfig = TrainConfig(
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    dtype=torch.float32,
+    vocab_size=50257,
+    context_length=256,
+    d_model=512,
+    num_layers=4,
+    num_heads=8,
+    d_ff=2048,
+    rope_theta=10000,
+    lr=3e-4,
+    lr_min=3e-5,
+    weight_decay=0.01,
+    betas=(0.95, 0.99),
+    eps=1e-8,
+    max_grad_norm=1.0,
+    token_ids_path="/root/autodl-tmp/data/openwebtext/openwebtext_train_tokens.npy",
+    checkpoint_dir="/root/autodl-tmp/data/openwebtext/checkpoints/muon_baseline",
+    val_token_ids_path="/root/autodl-tmp/data/openwebtext/openwebtext_valid_tokens.npy",
+    metrics_json_path="/root/autodl-tmp/data/openwebtext/metrics/muon_baseline_metrics.json",
+    batch_size=32,
+    micro_batch_size=8,
+    total_tokens=100_000_000,
+    validation_interval=20,
+    checkpoint_interval=500,
+    eval_batches=16,
+    use_wandb=False,
+    wandb_project="cs336-muon",
+    wandb_name="openwebtext_muon_baseline",
+    model_type="dense",
+    optimizer_type="muon",
+    use_amp=True,
+    amp_dtype="float16",
+    label_smoothing=0.05,
+    activation_checkpointing=True,
+    muon_ns_steps=5,
+    muon_ns_eps=1e-7,
+    muon_nesterov=True,
 )
 
 
@@ -230,7 +340,10 @@ def _evaluate_loss(
     context_length: int,
     device: str | torch.device,
     eval_batches: int,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> float:
+    is_cuda = _device_type(device) == "cuda"
     lm.eval()
     losses: list[float] = []
     with torch.no_grad():
@@ -241,8 +354,13 @@ def _evaluate_loss(
                 context_length=context_length,
                 device=device,
             )
-            logits = lm(inputs)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            with torch.autocast(
+                device_type="cuda",
+                dtype=amp_dtype,
+                enabled=use_amp and is_cuda,
+            ) if is_cuda else contextlib.nullcontext():
+                logits = lm(inputs)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             losses.append(loss.item())
     lm.train()
     return float(np.mean(losses))
@@ -283,6 +401,7 @@ def _dump_metrics_json(
 
 def train(config: TrainConfig) -> None:
     model_type = str(config.get("model_type", "dense"))
+    activation_checkpointing = bool(config.get("activation_checkpointing", False))
     if model_type == "dense":
         lm = TransformerLM(
             vocab_size=config["vocab_size"],
@@ -292,6 +411,7 @@ def train(config: TrainConfig) -> None:
             num_heads=config["num_heads"],
             d_ff=config["d_ff"],
             rope_theta=config["rope_theta"],
+            activation_checkpointing=activation_checkpointing,
             device=config["device"],
             dtype=config["dtype"],
         )
@@ -316,13 +436,53 @@ def train(config: TrainConfig) -> None:
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
-    adamw = AdamW(
-        lm.parameters(),
-        lr=config["lr"],
-        weight_decay=config["weight_decay"],
-        betas=config["betas"],
-        eps=config["eps"],
-    )
+    optimizer_type = str(config.get("optimizer_type", "adamw")).lower()
+    if optimizer_type == "adamw":
+        optimizer: torch.optim.Optimizer = AdamW(
+            lm.parameters(),
+            lr=config["lr"],
+            weight_decay=config["weight_decay"],
+            betas=config["betas"],
+            eps=config["eps"],
+        )
+    elif optimizer_type == "muon":
+        muon_params, fallback_params = _split_muon_parameter_groups(lm)
+        optimizer = Muon(
+            matrix_params=muon_params,
+            fallback_params=fallback_params,
+            lr=config["lr"],
+            weight_decay=config["weight_decay"],
+            betas=config["betas"],
+            eps=config["eps"],
+            ns_steps=int(config.get("muon_ns_steps", 5)),
+            ns_eps=float(config.get("muon_ns_eps", 1e-7)),
+            nesterov=bool(config.get("muon_nesterov", True)),
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer_type: {optimizer_type}")
+
+    device_type = _device_type(config["device"])
+    amp_requested = bool(config.get("use_amp", False))
+    use_amp = amp_requested and device_type == "cuda"
+    amp_dtype = _resolve_amp_dtype(str(config.get("amp_dtype", "float16")))
+    if use_amp and amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        print("Warning: bf16 AMP is not supported on this GPU; fallback to float16 AMP.")
+        amp_dtype = torch.float16
+    scaler_enabled = use_amp and amp_dtype == torch.float16
+    if device_type == "cuda":
+        try:
+            scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)  # type: ignore[attr-defined]
+        except Exception:
+            scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+
+    if amp_requested and not use_amp:
+        print("Warning: use_amp=True but device is not CUDA; AMP disabled.")
+
+    label_smoothing = float(config.get("label_smoothing", 0.0))
+    if not (0.0 <= label_smoothing < 1.0):
+        raise ValueError("label_smoothing must be in [0.0, 1.0)")
 
     token_ids = np.load(config["token_ids_path"], mmap_mode="r")
 
@@ -341,7 +501,7 @@ def train(config: TrainConfig) -> None:
     start_step = 0
     resume_checkpoint = config.get("resume_checkpoint")
     if resume_checkpoint:
-        start_step = load_checkpoint(resume_checkpoint, lm, adamw)
+        start_step = load_checkpoint(resume_checkpoint, lm, optimizer, scaler=scaler)
         print(f"Resumed checkpoint: {resume_checkpoint} (step={start_step})")
         if start_step >= total_steps:
             raise ValueError(
@@ -353,6 +513,10 @@ def train(config: TrainConfig) -> None:
     print(f"Start step: {start_step:,}")
     print(f"Train token file: {config['token_ids_path']}")
     print(f"Batch size: {config['batch_size']} (micro={micro_batch_size}, accum={grad_accum_steps})")
+    print(
+        f"Optimizer: {optimizer_type}, AMP={use_amp} ({amp_dtype}), "
+        f"activation_ckpt={activation_checkpointing}, label_smoothing={label_smoothing}"
+    )
     if val_token_ids is not None:
         print(f"Valid token file: {config['val_token_ids_path']}")
 
@@ -393,11 +557,11 @@ def train(config: TrainConfig) -> None:
         print(f"Metrics JSON file: {metrics_json_path}")
 
     for step in range(start_step, total_steps):
-        if isinstance(config["device"], torch.device) and config["device"].type == "cuda":
+        if device_type == "cuda":
             torch.cuda.reset_peak_memory_stats(config["device"])
 
         step_start = time.perf_counter()
-        adamw.zero_grad()
+        optimizer.zero_grad()
         step_main_loss = 0.0
         step_moe_aux_loss = 0.0
 
@@ -409,22 +573,39 @@ def train(config: TrainConfig) -> None:
                 device=config["device"],
             )
 
-            logits = lm(inputs)
-            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            with torch.autocast(
+                device_type="cuda",
+                dtype=amp_dtype,
+                enabled=use_amp and device_type == "cuda",
+            ) if device_type == "cuda" else contextlib.nullcontext():
+                logits = lm(inputs)
+                main_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    label_smoothing=label_smoothing,
+                )
 
-            moe_aux_loss = torch.zeros((), dtype=main_loss.dtype, device=main_loss.device)
-            if hasattr(lm, "get_aux_loss"):
-                aux_val = lm.get_aux_loss()  # type: ignore[attr-defined]
-                if isinstance(aux_val, torch.Tensor):
-                    moe_aux_loss = aux_val.to(main_loss.dtype)
+                moe_aux_loss = torch.zeros((), dtype=main_loss.dtype, device=main_loss.device)
+                if hasattr(lm, "get_aux_loss"):
+                    aux_val = lm.get_aux_loss()  # type: ignore[attr-defined]
+                    if isinstance(aux_val, torch.Tensor):
+                        moe_aux_loss = aux_val.to(main_loss.dtype)
 
-            micro_loss = main_loss + moe_aux_loss
-            (micro_loss / grad_accum_steps).backward()
+                micro_loss = main_loss + moe_aux_loss
+                scaled_loss = micro_loss / grad_accum_steps
+
+            if scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
 
             step_main_loss += float(main_loss.item())
             step_moe_aux_loss += float(moe_aux_loss.item())
 
-            del inputs, targets, logits, main_loss, moe_aux_loss, micro_loss
+            del inputs, targets, logits, main_loss, moe_aux_loss, micro_loss, scaled_loss
+
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
 
         gradient_clipping(lm.parameters(), config["max_grad_norm"])
 
@@ -435,10 +616,14 @@ def train(config: TrainConfig) -> None:
             T_w=max(1, total_steps // 10),
             T_c=max(1, total_steps),
         )
-        for param_group in adamw.param_groups:
+        for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        adamw.step()
+        if scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         step_time_s = time.perf_counter() - step_start
         tokens_per_step = config["batch_size"] * config["context_length"]
@@ -449,7 +634,7 @@ def train(config: TrainConfig) -> None:
         step_total_loss = step_main_loss + step_moe_aux_loss
 
         max_mem_gb = 0.0
-        if isinstance(config["device"], torch.device) and config["device"].type == "cuda":
+        if device_type == "cuda":
             max_mem_gb = torch.cuda.max_memory_allocated(config["device"]) / (1024**3)
 
         metrics = {
@@ -471,6 +656,8 @@ def train(config: TrainConfig) -> None:
                 context_length=config["context_length"],
                 device=config["device"],
                 eval_batches=eval_batches,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
             )
 
         if do_validate:
@@ -502,14 +689,14 @@ def train(config: TrainConfig) -> None:
         if (step + 1) % config["checkpoint_interval"] == 0:
             os.makedirs(config["checkpoint_dir"], exist_ok=True)
             checkpoint_path = os.path.join(config["checkpoint_dir"], f"checkpoint_step_{step + 1}.pt")
-            save_checkpoint(lm, adamw, step + 1, checkpoint_path)
+            save_checkpoint(lm, optimizer, step + 1, scaler, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
-            if isinstance(config["device"], torch.device) and config["device"].type == "cuda":
+            if device_type == "cuda":
                 torch.cuda.empty_cache()
 
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     checkpoint_path = os.path.join(config["checkpoint_dir"], "checkpoint_final.pt")
-    save_checkpoint(lm, adamw, total_steps, checkpoint_path)
+    save_checkpoint(lm, optimizer, total_steps, scaler, checkpoint_path)
     print(f"Saved final checkpoint to {checkpoint_path}")
 
     if metrics_json_path:
@@ -532,12 +719,14 @@ def _build_config(name: str) -> TrainConfig:
         return typing.cast(TrainConfig, dict(OpenWebTextBaselineConfig))
     if name == "owt_moe":
         return typing.cast(TrainConfig, dict(OpenWebTextMoEConfig))
+    if name == "owt_muon":
+        return typing.cast(TrainConfig, dict(OpenWebTextMuonConfig))
     raise ValueError(f"Unknown config: {name}")
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Transformer (dense or MoE)")
-    parser.add_argument("--config", choices=["tinystories", "owt", "owt_moe"], default="owt")
+    parser.add_argument("--config", choices=["tinystories", "owt", "owt_moe", "owt_muon"], default="owt")
     parser.add_argument("--token-ids-path", type=str, default=None)
     parser.add_argument("--val-token-ids-path", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
@@ -547,6 +736,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--context-length", type=int, default=None)
     parser.add_argument("--eval-batches", type=int, default=None)
     parser.add_argument("--metrics-json", type=str, default=None)
+    parser.add_argument("--optimizer-type", choices=["adamw", "muon"], default=None)
+    parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default=None)
+    parser.add_argument("--label-smoothing", type=float, default=None)
+    parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--muon-ns-steps", type=int, default=None)
+    parser.add_argument("--muon-ns-eps", type=float, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
     parser.add_argument("--moe-top-k", type=int, default=None)
     parser.add_argument("--moe-fixed-expert-idx", type=int, default=None)
@@ -586,6 +782,20 @@ if __name__ == "__main__":
         config["eval_batches"] = args.eval_batches
     if args.metrics_json is not None:
         config["metrics_json_path"] = args.metrics_json
+    if args.optimizer_type is not None:
+        config["optimizer_type"] = args.optimizer_type
+    if args.use_amp is not None:
+        config["use_amp"] = bool(args.use_amp)
+    if args.amp_dtype is not None:
+        config["amp_dtype"] = args.amp_dtype
+    if args.label_smoothing is not None:
+        config["label_smoothing"] = args.label_smoothing
+    if args.activation_checkpointing is not None:
+        config["activation_checkpointing"] = bool(args.activation_checkpointing)
+    if args.muon_ns_steps is not None:
+        config["muon_ns_steps"] = args.muon_ns_steps
+    if args.muon_ns_eps is not None:
+        config["muon_ns_eps"] = args.muon_ns_eps
     if args.num_experts is not None:
         config["num_experts"] = args.num_experts
     if args.moe_top_k is not None:

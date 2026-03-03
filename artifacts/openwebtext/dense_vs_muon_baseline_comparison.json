@@ -1,0 +1,47 @@
+{
+  "baseline": {
+    "name": "dense_baseline",
+    "status": "completed",
+    "steps_recorded": 12207,
+    "final_train_loss": 4.355679512023926,
+    "final_train_step": 12207,
+    "final_valid_loss": 4.3348614275455475,
+    "final_valid_step": 12200,
+    "final_valid_ppl": 76.31438308565285,
+    "best_valid_loss": 4.297402501106262,
+    "best_valid_step": 10360,
+    "best_valid_ppl": 73.50860697813587,
+    "avg_tokens_per_sec_tail": 10599.693705101154,
+    "avg_step_time_s_tail": 0.7729025697335601,
+    "max_memory_gb": 9.848196983337402,
+    "train_time_s": 9464.527849946171,
+    "train_time_h": 2.6290355138739363
+  },
+  "candidate": {
+    "name": "muon_baseline",
+    "status": "completed",
+    "steps_recorded": 12207,
+    "final_train_loss": 6.065572381019592,
+    "final_train_step": 12207,
+    "final_valid_loss": 5.843907177448273,
+    "final_valid_step": 12200,
+    "final_valid_ppl": 345.1251750467383,
+    "best_valid_loss": 5.667349189519882,
+    "best_valid_step": 12140,
+    "best_valid_ppl": 289.26672591535373,
+    "avg_tokens_per_sec_tail": 17146.29457286553,
+    "avg_step_time_s_tail": 0.47800005165860054,
+    "max_memory_gb": 2.3859195709228516,
+    "train_time_s": 5845.864977356046,
+    "train_time_h": 1.6238513825989018
+  },
+  "comparison": {
+    "loss_delta_final_valid": 1.5090457499027252,
+    "loss_delta_best_valid": 1.36994668841362,
+    "loss_pct_delta_final_valid": 34.81185673695608,
+    "ppl_delta_final_valid": 268.81079196108544,
+    "speed_ratio_tokens_per_sec_tail": 1.6176217020887869,
+    "time_ratio_train_time": 0.6176604971783451,
+    "memory_ratio_max_gb": 0.2422696839796862
+  }
+}

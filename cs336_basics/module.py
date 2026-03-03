@@ -3,6 +3,7 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as checkpoint_utils
 from einops import einsum, rearrange  # 张量维度操作库，简化维度变换和矩阵乘法
 from jaxtyping import Float, Int  # 类型注解，明确张量维度含义（提升代码可读性）
 
@@ -399,6 +400,7 @@ class TransformerLM(nn.Module):
             num_heads: int,  # 注意力头数
             d_ff: int,  # 前馈网络中间维度
             rope_theta: float,  # RoPE的Θ参数
+            activation_checkpointing: bool = False,
             device: torch.device | None = None,
             dtype: torch.dtype | None = None,
     ) -> None:
@@ -418,6 +420,7 @@ class TransformerLM(nn.Module):
         self.norm_final = RMSNorm(d_model, device=device, dtype=dtype)
         # 输出投影层（d_model → vocab_size，预测每个token的得分）
         self.output_embedding = Linear(d_model, vocab_size, device, dtype)
+        self.activation_checkpointing = activation_checkpointing
 
     def forward(
             self,
@@ -432,7 +435,10 @@ class TransformerLM(nn.Module):
 
         # 步骤2：逐层通过TransformerBlock
         for block in self.layers:
-            x = block(x)
+            if self.activation_checkpointing and self.training:
+                x = checkpoint_utils.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         # 步骤3：最终归一化
         x = self.norm_final(x)

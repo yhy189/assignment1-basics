@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Sequence
 
 import torch
 from jaxtyping import Float, Int  # 类型注解，明确张量维度含义
@@ -126,6 +126,163 @@ class AdamW(torch.optim.Optimizer):
                 state["v"] = v  # 保存新的二阶矩
 
         # 返回损失值（若有）
+        return loss
+
+
+# ===================== 3. Muon优化器（矩阵参数用Muon，其他参数用AdamW） =====================
+def _zeropower_newton_schulz(
+        update: torch.Tensor,
+        steps: int,
+        eps: float,
+) -> torch.Tensor:
+    """
+    使用 Newton-Schulz 迭代近似「矩阵0次幂」方向（正交化更新方向）。
+    该实现只在MuON参数更新时调用，并在float32中完成以保证数值稳定。
+    """
+    if steps <= 0:
+        return update
+
+    in_dtype = update.dtype
+    original_shape = update.shape
+
+    x = update
+    if x.ndim != 2:
+        x = x.reshape(x.shape[0], -1)
+
+    transposed = False
+    if x.shape[0] > x.shape[1]:
+        x = x.t()
+        transposed = True
+
+    x = x.to(torch.float32)
+    x = x / (torch.linalg.norm(x) + eps)
+
+    # Muon常用的五阶Newton-Schulz系数
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(steps):
+        xx_t = x @ x.t()
+        x = a * x + (b * xx_t + c * (xx_t @ xx_t)) @ x
+
+    if transposed:
+        x = x.t()
+
+    x = x.reshape(original_shape)
+    return x.to(in_dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """
+    简化版 Muon:
+    - 矩阵参数（通常是Linear权重）使用MuON正交化更新方向
+    - 非矩阵参数（bias/norm/embedding等）回退到AdamW
+    """
+
+    def __init__(
+            self,
+            matrix_params: Sequence[torch.nn.Parameter],
+            fallback_params: Sequence[torch.nn.Parameter],
+            lr: float = 3e-4,
+            weight_decay: float = 1e-2,
+            betas: tuple[float, float] = (0.95, 0.99),
+            eps: float = 1e-8,
+            nesterov: bool = True,
+            ns_steps: int = 5,
+            ns_eps: float = 1e-7,
+    ) -> None:
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if eps <= 0:
+            raise ValueError(f"Invalid epsilon: {eps}")
+        if ns_steps < 0:
+            raise ValueError(f"Invalid ns_steps: {ns_steps}")
+        if ns_eps <= 0:
+            raise ValueError(f"Invalid ns_eps: {ns_eps}")
+        if len(matrix_params) == 0 and len(fallback_params) == 0:
+            raise ValueError("Muon requires at least one parameter")
+
+        defaults = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "betas": betas,
+            "eps": eps,
+            "nesterov": nesterov,
+            "ns_steps": ns_steps,
+            "ns_eps": ns_eps,
+        }
+
+        param_groups = []
+        if len(matrix_params) > 0:
+            param_groups.append({"params": list(matrix_params), "muon": True})
+        if len(fallback_params) > 0:
+            param_groups.append({"params": list(fallback_params), "muon": False})
+
+        super().__init__(param_groups, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:  # type: ignore[override]
+        loss = None if closure is None else closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            nesterov = bool(group["nesterov"])
+            ns_steps = int(group["ns_steps"])
+            ns_eps = float(group["ns_eps"])
+            use_muon = bool(group.get("muon", False))
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+
+                if use_muon:
+                    state = self.state[p]
+                    m = state.get("momentum_buffer")
+                    if m is None:
+                        m = torch.zeros_like(p)
+
+                    # Muon动量更新
+                    m.mul_(beta1).add_(g, alpha=(1.0 - beta1))
+                    update = g.add(m, alpha=beta1) if nesterov else m
+                    update = _zeropower_newton_schulz(update, steps=ns_steps, eps=ns_eps)
+
+                    # 用原始更新范数做缩放，避免步长偏移过大
+                    raw_norm = torch.linalg.norm(m.to(torch.float32))
+                    update_norm = torch.linalg.norm(update.to(torch.float32))
+                    if float(update_norm) > 0.0:
+                        update = update * (raw_norm / (update_norm + 1e-12))
+
+                    if weight_decay != 0:
+                        p.data.mul_(1.0 - lr * weight_decay)
+                    p.data.add_(update.to(p.data.dtype), alpha=-lr)
+
+                    state["momentum_buffer"] = m
+                    continue
+
+                # fallback: AdamW
+                state = self.state[p]
+                t = int(state.get("t", 0)) + 1
+                m = state.get("m")
+                v = state.get("v")
+                if m is None:
+                    m = torch.zeros_like(p)
+                if v is None:
+                    v = torch.zeros_like(p)
+
+                m.mul_(beta1).add_(g, alpha=(1.0 - beta1))
+                v.mul_(beta2).addcmul_(g, g, value=(1.0 - beta2))
+
+                lr_t = lr * math.sqrt(1.0 - beta2 ** t) / (1.0 - beta1 ** t)
+                if weight_decay != 0:
+                    p.data.mul_(1.0 - lr * weight_decay)
+                p.data.addcdiv_(m, torch.sqrt(v) + eps, value=-lr_t)
+
+                state["t"] = t
+                state["m"] = m
+                state["v"] = v
+
         return loss
 
 
