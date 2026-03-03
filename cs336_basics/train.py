@@ -21,10 +21,12 @@ except Exception:
 try:
     from .module import TransformerLM
     from .moe import MoETransformerLM
+    from .mla import MLATransformerLM
     from .optimizer import AdamW, Muon, get_lr_cosine_schedule, gradient_clipping
 except ImportError:
     from module import TransformerLM
     from moe import MoETransformerLM
+    from mla import MLATransformerLM
     from optimizer import AdamW, Muon, get_lr_cosine_schedule, gradient_clipping
 
 
@@ -163,6 +165,7 @@ class TrainConfig(typing.TypedDict):
     muon_ns_steps: typing.NotRequired[int]
     muon_ns_eps: typing.NotRequired[float]
     muon_nesterov: typing.NotRequired[bool]
+    mla_d_model: typing.NotRequired[int]
     num_experts: typing.NotRequired[int]
     moe_top_k: typing.NotRequired[int]
     moe_fixed_expert_idx: typing.NotRequired[int]
@@ -333,6 +336,45 @@ OpenWebTextMuonConfig = TrainConfig(
 )
 
 
+OpenWebTextMLAConfig = TrainConfig(
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    dtype=torch.float32,
+    vocab_size=50257,
+    context_length=256,
+    d_model=512,
+    num_layers=4,
+    num_heads=8,
+    d_ff=2048,
+    rope_theta=10000,
+    lr=3e-4,
+    lr_min=3e-5,
+    weight_decay=0.01,
+    betas=(0.9, 0.999),
+    eps=1e-8,
+    max_grad_norm=1.0,
+    token_ids_path="/root/autodl-tmp/data/openwebtext/openwebtext_train_tokens.npy",
+    checkpoint_dir="/root/autodl-tmp/data/openwebtext/checkpoints/mla_baseline",
+    val_token_ids_path="/root/autodl-tmp/data/openwebtext/openwebtext_valid_tokens.npy",
+    metrics_json_path="/root/autodl-tmp/data/openwebtext/metrics/mla_baseline_metrics.json",
+    batch_size=32,
+    micro_batch_size=32,
+    total_tokens=100_000_000,
+    validation_interval=20,
+    checkpoint_interval=500,
+    eval_batches=16,
+    use_wandb=False,
+    wandb_project="cs336-mla",
+    wandb_name="openwebtext_mla_baseline",
+    model_type="mla",
+    optimizer_type="adamw",
+    use_amp=False,
+    amp_dtype="float16",
+    label_smoothing=0.0,
+    activation_checkpointing=False,
+    mla_d_model=256,
+)
+
+
 def _evaluate_loss(
     lm: torch.nn.Module,
     token_ids: npt.NDArray,
@@ -407,6 +449,20 @@ def train(config: TrainConfig) -> None:
             vocab_size=config["vocab_size"],
             context_length=config["context_length"],
             d_model=config["d_model"],
+            num_layers=config["num_layers"],
+            num_heads=config["num_heads"],
+            d_ff=config["d_ff"],
+            rope_theta=config["rope_theta"],
+            activation_checkpointing=activation_checkpointing,
+            device=config["device"],
+            dtype=config["dtype"],
+        )
+    elif model_type == "mla":
+        lm = MLATransformerLM(
+            vocab_size=config["vocab_size"],
+            context_length=config["context_length"],
+            d_model=config["d_model"],
+            latent_d_model=int(config.get("mla_d_model", max(config["num_heads"], config["d_model"] // 2))),
             num_layers=config["num_layers"],
             num_heads=config["num_heads"],
             d_ff=config["d_ff"],
@@ -717,6 +773,8 @@ def _build_config(name: str) -> TrainConfig:
         return typing.cast(TrainConfig, dict(TinyStoriesConfig))
     if name == "owt":
         return typing.cast(TrainConfig, dict(OpenWebTextBaselineConfig))
+    if name == "owt_mla":
+        return typing.cast(TrainConfig, dict(OpenWebTextMLAConfig))
     if name == "owt_moe":
         return typing.cast(TrainConfig, dict(OpenWebTextMoEConfig))
     if name == "owt_muon":
@@ -726,7 +784,11 @@ def _build_config(name: str) -> TrainConfig:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Transformer (dense or MoE)")
-    parser.add_argument("--config", choices=["tinystories", "owt", "owt_moe", "owt_muon"], default="owt")
+    parser.add_argument(
+        "--config",
+        choices=["tinystories", "owt", "owt_mla", "owt_moe", "owt_muon"],
+        default="owt",
+    )
     parser.add_argument("--token-ids-path", type=str, default=None)
     parser.add_argument("--val-token-ids-path", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
@@ -743,6 +805,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--muon-ns-steps", type=int, default=None)
     parser.add_argument("--muon-ns-eps", type=float, default=None)
+    parser.add_argument("--mla-d-model", type=int, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
     parser.add_argument("--moe-top-k", type=int, default=None)
     parser.add_argument("--moe-fixed-expert-idx", type=int, default=None)
@@ -796,6 +859,8 @@ if __name__ == "__main__":
         config["muon_ns_steps"] = args.muon_ns_steps
     if args.muon_ns_eps is not None:
         config["muon_ns_eps"] = args.muon_ns_eps
+    if args.mla_d_model is not None:
+        config["mla_d_model"] = args.mla_d_model
     if args.num_experts is not None:
         config["num_experts"] = args.num_experts
     if args.moe_top_k is not None:
