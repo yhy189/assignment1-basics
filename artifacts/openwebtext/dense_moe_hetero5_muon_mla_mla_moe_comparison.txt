@@ -1,0 +1,82 @@
+DENSE (status=completed)
+  final_valid_loss=4.3348614275455475
+  best_valid_loss=4.297402501106262 @ step=10360
+  avg_tok_s_tail=10599.693705101154
+  max_mem_gb=9.848196983337402
+  train_time_h=2.6290355138739363
+
+MOE (status=completed)
+  final_valid_loss=4.296913206577301
+  best_valid_loss=4.231844514608383 @ step=11740
+  avg_tok_s_tail=8837.322100904226
+  max_mem_gb=9.607935905456543
+  train_time_h=3.13483851282133
+
+MUON (status=completed)
+  final_valid_loss=5.843907177448273
+  best_valid_loss=5.667349189519882 @ step=12140
+  avg_tok_s_tail=17146.29457286553
+  max_mem_gb=2.3859195709228516
+  train_time_h=1.6238513825989018
+
+MLA (status=completed)
+  final_valid_loss=4.419381111860275
+  best_valid_loss=4.379022866487503 @ step=12180
+  avg_tok_s_tail=25849.309643406203
+  max_mem_gb=7.404918670654297
+  train_time_h=1.07638226119284
+
+MLA_MOE (status=completed)
+  final_valid_loss=4.542996287345886
+  best_valid_loss=4.431345820426941 @ step=12180
+  avg_tok_s_tail=20022.71408569322
+  max_mem_gb=9.072280406951904
+  train_time_h=1.3941958525031806
+
+Pairwise:
+  moe_vs_dense:
+    loss_delta_final_valid=-0.03794822096824646
+    loss_pct_delta_final_valid=-0.8754194707841726
+    speed_ratio_tokens_per_sec_tail=0.833733723517994
+    memory_ratio_max_gb=0.9756035466910981
+    time_ratio_train_time=1.1923910864947134
+  muon_vs_dense:
+    loss_delta_final_valid=1.5090457499027252
+    loss_pct_delta_final_valid=34.81185673695608
+    speed_ratio_tokens_per_sec_tail=1.6176217020887869
+    memory_ratio_max_gb=0.2422696839796862
+    time_ratio_train_time=0.6176604971783451
+  mla_vs_dense:
+    loss_delta_final_valid=0.08451968431472778
+    loss_pct_delta_final_valid=1.9497666932939048
+    speed_ratio_tokens_per_sec_tail=2.438684584910798
+    memory_ratio_max_gb=0.7519060273858255
+    time_ratio_train_time=0.4094209665531559
+  mla_moe_vs_dense:
+    loss_delta_final_valid=0.20813485980033875
+    loss_pct_delta_final_valid=4.801418990645505
+    speed_ratio_tokens_per_sec_tail=1.8889898748731948
+    memory_ratio_max_gb=0.9212123216363051
+    time_ratio_train_time=0.5303069681431595
+  mla_moe_vs_moe:
+    loss_delta_final_valid=0.2460830807685852
+    loss_pct_delta_final_valid=5.726973502557718
+    speed_ratio_tokens_per_sec_tail=2.2656992533569094
+    memory_ratio_max_gb=0.9442486394814074
+    time_ratio_train_time=0.4447424793337808
+  mla_moe_vs_mla:
+    loss_delta_final_valid=0.12361517548561096
+    loss_pct_delta_final_valid=2.79711507916494
+    speed_ratio_tokens_per_sec_tail=0.7745937652459022
+    memory_ratio_max_gb=1.2251694867231107
+    time_ratio_train_time=1.2952608964013783
+  mla_moe_vs_muon:
+    loss_delta_final_valid=-1.3009108901023865
+    loss_pct_delta_final_valid=-22.260977982720558
+    speed_ratio_tokens_per_sec_tail=1.1677575000595
+    memory_ratio_max_gb=3.8024250764843806
+    time_ratio_train_time=0.8585735538629355
+
+Ranking(final_valid_loss asc): ['moe', 'dense', 'mla', 'mla_moe', 'muon']
+Ranking(avg_tokens_per_sec desc): ['mla', 'mla_moe', 'muon', 'dense', 'moe']
+Ranking(max_memory_gb asc): ['muon', 'mla', 'mla_moe', 'moe', 'dense']

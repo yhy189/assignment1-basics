@@ -1,0 +1,22 @@
+Baseline: dense_baseline (status=completed)
+  final_valid_loss=4.3348614275455475
+  best_valid_loss=4.297402501106262 @ step=10360
+  avg_tok_s_tail=10599.693705101154
+  max_mem_gb=9.848196983337402
+  train_time_h=2.6290355138739363
+
+Candidate: mla_moe_hetero5 (status=completed)
+  final_valid_loss=4.542996287345886
+  best_valid_loss=4.431345820426941 @ step=12180
+  avg_tok_s_tail=20022.71408569322
+  max_mem_gb=9.072280406951904
+  train_time_h=1.3941958525031806
+
+Comparison:
+  loss_delta_final_valid=0.20813485980033875
+  loss_delta_best_valid=0.1339433193206787
+  loss_pct_delta_final_valid=4.801418990645505
+  ppl_delta_final_valid=17.657562578726782
+  speed_ratio_tokens_per_sec_tail=1.8889898748731948
+  time_ratio_train_time=0.5303069681431595
+  memory_ratio_max_gb=0.9212123216363051

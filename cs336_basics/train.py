@@ -22,11 +22,13 @@ try:
     from .module import TransformerLM
     from .moe import MoETransformerLM
     from .mla import MLATransformerLM
+    from .mla_moe import MLAMoETransformerLM
     from .optimizer import AdamW, Muon, get_lr_cosine_schedule, gradient_clipping
 except ImportError:
     from module import TransformerLM
     from moe import MoETransformerLM
     from mla import MLATransformerLM
+    from mla_moe import MLAMoETransformerLM
     from optimizer import AdamW, Muon, get_lr_cosine_schedule, gradient_clipping
 
 
@@ -65,6 +67,12 @@ def save_checkpoint(
     }
     if scaler is not None and scaler.is_enabled():
         checkpoint["scaler"] = scaler.state_dict()
+    if isinstance(out, (str, os.PathLike)):
+        out_path = os.fspath(out)
+        tmp_path = f"{out_path}.tmp"
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, out_path)
+        return
     torch.save(checkpoint, out)
 
 
@@ -151,6 +159,7 @@ class TrainConfig(typing.TypedDict):
     validation_interval: int
     checkpoint_interval: int
     eval_batches: typing.NotRequired[int]
+    max_step_checkpoints: typing.NotRequired[int | None]
 
     use_wandb: typing.NotRequired[bool]
     wandb_project: str
@@ -375,6 +384,52 @@ OpenWebTextMLAConfig = TrainConfig(
 )
 
 
+OpenWebTextMLAMoEConfig = TrainConfig(
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    dtype=torch.float32,
+    vocab_size=50257,
+    context_length=256,
+    d_model=512,
+    num_layers=4,
+    num_heads=8,
+    d_ff=2048,
+    rope_theta=10000,
+    lr=2.5e-4,
+    lr_min=2.5e-5,
+    weight_decay=0.01,
+    betas=(0.9, 0.999),
+    eps=1e-8,
+    max_grad_norm=1.0,
+    token_ids_path="/root/autodl-tmp/data/openwebtext/openwebtext_train_tokens.npy",
+    checkpoint_dir="/root/autodl-tmp/data/openwebtext/checkpoints/mla_moe_hetero5",
+    val_token_ids_path="/root/autodl-tmp/data/openwebtext/openwebtext_valid_tokens.npy",
+    metrics_json_path="/root/autodl-tmp/data/openwebtext/metrics/mla_moe_hetero5_metrics.json",
+    batch_size=32,
+    micro_batch_size=32,
+    total_tokens=100_000_000,
+    validation_interval=20,
+    checkpoint_interval=2000,
+    eval_batches=16,
+    max_step_checkpoints=2,
+    use_wandb=False,
+    wandb_project="cs336-mla-moe",
+    wandb_name="openwebtext_mla_moe_hetero5",
+    model_type="mla_moe",
+    optimizer_type="adamw",
+    use_amp=True,
+    amp_dtype="float16",
+    label_smoothing=0.0,
+    activation_checkpointing=False,
+    mla_d_model=256,
+    num_experts=5,
+    moe_top_k=2,
+    moe_fixed_expert_idx=0,
+    moe_expert_d_ffs=[2048, 1024, 1024, 1024, 1024],
+    moe_aux_loss_coef=1e-2,
+    moe_z_loss_coef=1e-4,
+)
+
+
 def _evaluate_loss(
     lm: torch.nn.Module,
     token_ids: npt.NDArray,
@@ -441,6 +496,27 @@ def _dump_metrics_json(
     os.replace(tmp_path, metrics_json_path)
 
 
+def _prune_old_step_checkpoints(checkpoint_dir: str | os.PathLike, keep: int) -> None:
+    entries: list[tuple[int, str]] = []
+    for filename in os.listdir(checkpoint_dir):
+        if not filename.startswith("checkpoint_step_") or not filename.endswith(".pt"):
+            continue
+        step_str = filename[len("checkpoint_step_") : -len(".pt")]
+        if not step_str.isdigit():
+            continue
+        entries.append((int(step_str), filename))
+
+    entries.sort(key=lambda x: x[0], reverse=True)
+    to_remove = entries[keep:]
+    for _, filename in to_remove:
+        path = os.path.join(checkpoint_dir, filename)
+        try:
+            os.remove(path)
+            print(f"Pruned old checkpoint: {path}")
+        except OSError as ex:
+            print(f"Warning: failed to remove old checkpoint {path}: {ex}")
+
+
 def train(config: TrainConfig) -> None:
     model_type = str(config.get("model_type", "dense"))
     activation_checkpointing = bool(config.get("activation_checkpointing", False))
@@ -467,6 +543,26 @@ def train(config: TrainConfig) -> None:
             num_heads=config["num_heads"],
             d_ff=config["d_ff"],
             rope_theta=config["rope_theta"],
+            activation_checkpointing=activation_checkpointing,
+            device=config["device"],
+            dtype=config["dtype"],
+        )
+    elif model_type == "mla_moe":
+        lm = MLAMoETransformerLM(
+            vocab_size=config["vocab_size"],
+            context_length=config["context_length"],
+            d_model=config["d_model"],
+            latent_d_model=int(config.get("mla_d_model", max(config["num_heads"], config["d_model"] // 2))),
+            num_layers=config["num_layers"],
+            num_heads=config["num_heads"],
+            d_ff=config["d_ff"],
+            rope_theta=config["rope_theta"],
+            num_experts=int(config.get("num_experts", 5)),
+            moe_top_k=int(config.get("moe_top_k", 1)),
+            moe_fixed_expert_idx=int(config.get("moe_fixed_expert_idx", 0)),
+            moe_expert_d_ffs=typing.cast(list[int] | None, config.get("moe_expert_d_ffs")),
+            moe_aux_loss_coef=float(config.get("moe_aux_loss_coef", 1e-2)),
+            moe_z_loss_coef=float(config.get("moe_z_loss_coef", 1e-4)),
             activation_checkpointing=activation_checkpointing,
             device=config["device"],
             dtype=config["dtype"],
@@ -539,6 +635,13 @@ def train(config: TrainConfig) -> None:
     label_smoothing = float(config.get("label_smoothing", 0.0))
     if not (0.0 <= label_smoothing < 1.0):
         raise ValueError("label_smoothing must be in [0.0, 1.0)")
+    max_step_checkpoints: int | None
+    if config.get("max_step_checkpoints") is None:
+        max_step_checkpoints = None
+    else:
+        max_step_checkpoints = int(typing.cast(int, config.get("max_step_checkpoints")))
+        if max_step_checkpoints < 0:
+            raise ValueError("max_step_checkpoints must be >= 0")
 
     token_ids = np.load(config["token_ids_path"], mmap_mode="r")
 
@@ -571,7 +674,8 @@ def train(config: TrainConfig) -> None:
     print(f"Batch size: {config['batch_size']} (micro={micro_batch_size}, accum={grad_accum_steps})")
     print(
         f"Optimizer: {optimizer_type}, AMP={use_amp} ({amp_dtype}), "
-        f"activation_ckpt={activation_checkpointing}, label_smoothing={label_smoothing}"
+        f"activation_ckpt={activation_checkpointing}, label_smoothing={label_smoothing}, "
+        f"max_step_checkpoints={max_step_checkpoints if max_step_checkpoints is not None else 'all'}"
     )
     if val_token_ids is not None:
         print(f"Valid token file: {config['val_token_ids_path']}")
@@ -747,6 +851,8 @@ def train(config: TrainConfig) -> None:
             checkpoint_path = os.path.join(config["checkpoint_dir"], f"checkpoint_step_{step + 1}.pt")
             save_checkpoint(lm, optimizer, step + 1, scaler, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
+            if max_step_checkpoints is not None:
+                _prune_old_step_checkpoints(config["checkpoint_dir"], keep=max_step_checkpoints)
             if device_type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -775,6 +881,8 @@ def _build_config(name: str) -> TrainConfig:
         return typing.cast(TrainConfig, dict(OpenWebTextBaselineConfig))
     if name == "owt_mla":
         return typing.cast(TrainConfig, dict(OpenWebTextMLAConfig))
+    if name == "owt_mla_moe":
+        return typing.cast(TrainConfig, dict(OpenWebTextMLAMoEConfig))
     if name == "owt_moe":
         return typing.cast(TrainConfig, dict(OpenWebTextMoEConfig))
     if name == "owt_muon":
@@ -786,18 +894,20 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Transformer (dense or MoE)")
     parser.add_argument(
         "--config",
-        choices=["tinystories", "owt", "owt_mla", "owt_moe", "owt_muon"],
+        choices=["tinystories", "owt", "owt_mla", "owt_mla_moe", "owt_moe", "owt_muon"],
         default="owt",
     )
     parser.add_argument("--token-ids-path", type=str, default=None)
     parser.add_argument("--val-token-ids-path", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument("--total-tokens", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--context-length", type=int, default=None)
     parser.add_argument("--eval-batches", type=int, default=None)
     parser.add_argument("--metrics-json", type=str, default=None)
+    parser.add_argument("--max-step-checkpoints", type=int, default=None)
     parser.add_argument("--optimizer-type", choices=["adamw", "muon"], default=None)
     parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default=None)
@@ -833,6 +943,8 @@ if __name__ == "__main__":
         config["val_token_ids_path"] = args.val_token_ids_path
     if args.checkpoint_dir:
         config["checkpoint_dir"] = args.checkpoint_dir
+    if args.checkpoint_interval is not None:
+        config["checkpoint_interval"] = args.checkpoint_interval
     if args.total_tokens is not None:
         config["total_tokens"] = args.total_tokens
     if args.batch_size is not None:
@@ -845,6 +957,8 @@ if __name__ == "__main__":
         config["eval_batches"] = args.eval_batches
     if args.metrics_json is not None:
         config["metrics_json_path"] = args.metrics_json
+    if args.max_step_checkpoints is not None:
+        config["max_step_checkpoints"] = args.max_step_checkpoints
     if args.optimizer_type is not None:
         config["optimizer_type"] = args.optimizer_type
     if args.use_amp is not None:

@@ -1,0 +1,47 @@
+{
+  "baseline": {
+    "name": "dense_baseline",
+    "status": "completed",
+    "steps_recorded": 12207,
+    "final_train_loss": 4.355679512023926,
+    "final_train_step": 12207,
+    "final_valid_loss": 4.3348614275455475,
+    "final_valid_step": 12200,
+    "final_valid_ppl": 76.31438308565285,
+    "best_valid_loss": 4.297402501106262,
+    "best_valid_step": 10360,
+    "best_valid_ppl": 73.50860697813587,
+    "avg_tokens_per_sec_tail": 10599.693705101154,
+    "avg_step_time_s_tail": 0.7729025697335601,
+    "max_memory_gb": 9.848196983337402,
+    "train_time_s": 9464.527849946171,
+    "train_time_h": 2.6290355138739363
+  },
+  "candidate": {
+    "name": "mla_moe_hetero5",
+    "status": "completed",
+    "steps_recorded": 12207,
+    "final_train_loss": 4.722156662493944,
+    "final_train_step": 12207,
+    "final_valid_loss": 4.542996287345886,
+    "final_valid_step": 12200,
+    "final_valid_ppl": 93.97194566437963,
+    "best_valid_loss": 4.431345820426941,
+    "best_valid_step": 12180,
+    "best_valid_ppl": 84.04444956937883,
+    "avg_tokens_per_sec_tail": 20022.71408569322,
+    "avg_step_time_s_tail": 0.4093112322688103,
+    "max_memory_gb": 9.072280406951904,
+    "train_time_s": 5019.10506901145,
+    "train_time_h": 1.3941958525031806
+  },
+  "comparison": {
+    "loss_delta_final_valid": 0.20813485980033875,
+    "loss_delta_best_valid": 0.1339433193206787,
+    "loss_pct_delta_final_valid": 4.801418990645505,
+    "ppl_delta_final_valid": 17.657562578726782,
+    "speed_ratio_tokens_per_sec_tail": 1.8889898748731948,
+    "time_ratio_train_time": 0.5303069681431595,
+    "memory_ratio_max_gb": 0.9212123216363051
+  }
+}
